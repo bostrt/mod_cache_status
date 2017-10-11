@@ -2,23 +2,60 @@
 #include <http_config.h>
 #include <http_log.h>
 #include <mod_cache.h>
+#include <apr_shm.h>
+#include <apr.h>
 
 module AP_MODULE_DECLARE_DATA cache_status_module;
 
-// TODO: Put these into shared memory.
-static int hit = 0;
-static int total = 0;
+apr_shm_t *status_shm;
+
+typedef struct status_data {
+  int hit;
+  int total;
+} status_data;
 
 // TODO: Create cache_status handler that outputs current hit/miss ratio.
+// TODO: Need locking..
 
-static int cache_status(cache_handle_t *h, request_rec *r, apr_table_t *headers, ap_cache_status_e status, const char *reason)
+static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
+{
+  void *data;
+  const char *userdata_key = "cache_status_post_config";
+  apr_status_t rs;
+  status_data *sdata;
+
+  ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, "mod_cache_status post config");
+
+  apr_pool_userdata_get(&data, userdata_key, s->process->pool);
+  if (!data) {
+    // Do nothing on first call.
+    apr_pool_userdata_set((const void *)1, userdata_key, apr_pool_cleanup_null, s->process->pool);
+    return OK;
+  }
+
+  rs = apr_shm_create(&status_shm, sizeof(status_shm), NULL, pconf);
+  if (rs != APR_SUCCESS) {
+      ap_log_error(APLOG_MARK, APLOG_ERR, rs, s,
+                   "Failed to create shared memory segment on file");
+      return HTTP_INTERNAL_SERVER_ERROR;
+  }
+
+  sdata = (status_data *) apr_shm_baseaddr_get(status_shm);
+  sdata->hit = 0;
+  sdata->total = 0;
+
+  return OK;
+}
+
+static int cache_status_hook_handler(cache_handle_t *h, request_rec *r, apr_table_t *headers, ap_cache_status_e status, const char *reason)
 {
   ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server, "mod_cache_status go!");
+  status_data *sdata = (status_data *) apr_shm_baseaddr_get(status_shm);
 
   switch (status) {
     case AP_CACHE_HIT:
     case AP_CACHE_REVALIDATE: {
-      hit++;
+      sdata->hit++;
       break;
     }
     case AP_CACHE_MISS:
@@ -27,16 +64,17 @@ static int cache_status(cache_handle_t *h, request_rec *r, apr_table_t *headers,
     }
   }
 
-  total++;
+  sdata->total++;
 
-  ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server, "Current hit/miss ratio %d/%d %f", hit, total, hit/(total*1.0));
+  ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server, "Current hit/miss ratio %d/%d %f", sdata->hit, sdata->total, sdata->hit/(sdata->total*1.0));
 
   return 1;
 }
 
 static void register_hooks(apr_pool_t *p)
 {
-  cache_hook_cache_status(cache_status, NULL, NULL, APR_HOOK_REALLY_LAST);
+  ap_hook_post_config(cache_status_post_config, NULL, NULL, APR_HOOK_MIDDLE);
+  cache_hook_cache_status(cache_status_hook_handler, NULL, NULL, APR_HOOK_REALLY_LAST);
 }
 
 AP_DECLARE_MODULE( cache_status ) =
