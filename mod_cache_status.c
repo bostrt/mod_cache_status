@@ -20,6 +20,9 @@ typedef struct status_data {
 
 apr_global_mutex_t *shm_mutex;
 
+/**
+ * Handle CacheStatus configuraiton directive.
+ */
 static const char * cache_status_enable(cmd_parms *cmd, void *xxx, int on)
 {
   const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
@@ -32,6 +35,9 @@ static const char * cache_status_enable(cmd_parms *cmd, void *xxx, int on)
   return NULL;
 }
 
+/**
+ * Post configuration steps. Initialize miscellaneous parts of mod_cache_status.
+ */
 static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
   if (!enabled) {
@@ -42,8 +48,6 @@ static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_poo
   const char *userdata_key = "cache_status_post_config";
   apr_status_t rs;
   status_data *sdata;
-  
-  ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, "mod_cache_status post config");
 
   apr_pool_userdata_get(&data, userdata_key, s->process->pool);
   if (!data) {
@@ -51,7 +55,10 @@ static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_poo
     apr_pool_userdata_set((const void *)1, userdata_key, apr_pool_cleanup_null, s->process->pool);
     return OK;
   }
-
+  
+  ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, "mod_cache_status post config");
+  
+  // initialize mutex used with shared memory
   rs = apr_global_mutex_create(&shm_mutex, NULL, APR_LOCK_DEFAULT, pconf);
   
   if (rs != APR_SUCCESS) {
@@ -60,8 +67,10 @@ static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_poo
     return HTTP_INTERNAL_SERVER_ERROR;    
   }
 
+  // set perms. TODO: do something OS-agnostic here.
   ap_unixd_set_global_mutex_perms(shm_mutex);
   
+  // Create the shared memory.
   rs = apr_shm_create(&status_shm, sizeof(status_shm), NULL, pconf);
   if (rs != APR_SUCCESS) {
       ap_log_error(APLOG_MARK, APLOG_ERR, rs, s,
@@ -69,6 +78,7 @@ static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_poo
       return HTTP_INTERNAL_SERVER_ERROR;
   }
 
+  // initialize status data to zeroes.
   sdata = (status_data *) apr_shm_baseaddr_get(status_shm);
   sdata->hit = 0;
   sdata->total = 0;
@@ -76,6 +86,9 @@ static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_poo
   return OK;
 }
 
+/**
+ * Initialize shared memory mutex for this new httpd child process.
+ */
 static void hook_child_init(apr_pool_t *mp, server_rec *s)
 {
   if (!enabled) {
@@ -88,6 +101,9 @@ static void hook_child_init(apr_pool_t *mp, server_rec *s)
   }
 }
 
+/**
+ * Hook into mod_cache. When a cache access is performed, handle the result of the operation (i.e. track cache miss, hit, etc).
+ */
 static int cache_status_hook_handler(cache_handle_t *h, request_rec *r, apr_table_t *headers, ap_cache_status_e status, const char *reason)
 {
   if (!enabled) {
@@ -95,14 +111,19 @@ static int cache_status_hook_handler(cache_handle_t *h, request_rec *r, apr_tabl
   }
   apr_status_t rs;
   ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server, "mod_cache_status go!");
+  
+  // Lock shared memory
   rs = apr_global_mutex_lock(shm_mutex);
   if (rs != APR_SUCCESS) {
     ap_log_error(APLOG_MARK, APLOG_ERR, rs, r->server,
                  "Failed to acquire lock to update mod_cache_status.");    
     return !OK;
   }
+  
+  // Pull in status data to update.
   status_data *sdata = (status_data *) apr_shm_baseaddr_get(status_shm);
 
+  // Update status data.
   switch (status) {
     case AP_CACHE_HIT:
     case AP_CACHE_REVALIDATE: {
@@ -119,6 +140,7 @@ static int cache_status_hook_handler(cache_handle_t *h, request_rec *r, apr_tabl
 
   ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server, "Current hit/miss ratio %d/%d %f", sdata->hit, sdata->total, sdata->hit/(sdata->total*1.0));
 
+  // Unlock shared memory.
   apr_global_mutex_unlock(shm_mutex);
   return 1;
 }
