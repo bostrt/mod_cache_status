@@ -9,6 +9,8 @@
 
 module AP_MODULE_DECLARE_DATA cache_status_module;
 
+static int enabled = 0;
+
 apr_shm_t *status_shm;
 
 typedef struct status_data {
@@ -18,8 +20,24 @@ typedef struct status_data {
 
 apr_global_mutex_t *shm_mutex;
 
+static const char * cache_status_enable(cmd_parms *cmd, void *xxx, int on)
+{
+  const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
+  if (err != NULL) {
+    return err;
+  }
+  
+  enabled = on;
+  
+  return NULL;
+}
+
 static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
+  if (!enabled) {
+    return OK;
+  }
+  
   void *data;
   const char *userdata_key = "cache_status_post_config";
   apr_status_t rs;
@@ -60,6 +78,9 @@ static int cache_status_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_poo
 
 static void hook_child_init(apr_pool_t *mp, server_rec *s)
 {
+  if (!enabled) {
+    return;
+  }
   apr_status_t rs = apr_global_mutex_child_init(&shm_mutex, NULL, mp);
   if (rs != APR_SUCCESS) {
     ap_log_error(APLOG_MARK, APLOG_ERR, rs, s,
@@ -69,6 +90,9 @@ static void hook_child_init(apr_pool_t *mp, server_rec *s)
 
 static int cache_status_hook_handler(cache_handle_t *h, request_rec *r, apr_table_t *headers, ap_cache_status_e status, const char *reason)
 {
+  if (!enabled) {
+    return OK;
+  }
   apr_status_t rs;
   ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server, "mod_cache_status go!");
   rs = apr_global_mutex_lock(shm_mutex);
@@ -99,6 +123,13 @@ static int cache_status_hook_handler(cache_handle_t *h, request_rec *r, apr_tabl
   return 1;
 }
 
+static const command_rec commands[] = 
+{
+  AP_INIT_FLAG("CacheStatus", cache_status_enable, NULL, RSRC_CONF,
+                "Enable mod_cache_status (Default: Off)"),
+  { NULL }
+};
+
 static void register_hooks(apr_pool_t *p)
 {
   ap_hook_post_config(cache_status_post_config, NULL, NULL, APR_HOOK_MIDDLE);
@@ -113,6 +144,6 @@ AP_DECLARE_MODULE( cache_status ) =
   NULL,
   NULL,
   NULL,
-  NULL,
+  commands,
   register_hooks,
 };
